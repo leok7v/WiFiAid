@@ -187,18 +187,20 @@ nonisolated struct RouteInfo: Sendable {
     let mask: IPv4
 }
 
-nonisolated func discoverDefaultRoute() -> RouteInfo? {
+nonisolated func discoverDefaultRoutes() -> [RouteInfo] {
     var mib: [Int32] = [
         CTL_NET, PF_ROUTE, 0, AF_INET, RT.NRT_DUMP, 0,
     ]
     var len = 0
-    guard sysctl(&mib, 6, nil, &len, nil, 0) == 0 else { return nil }
+    guard sysctl(&mib, 6, nil, &len, nil, 0) == 0 else { return [] }
     let buf = UnsafeMutableRawPointer.allocate(
         byteCount: len, alignment: 8
     )
     defer { buf.deallocate() }
-    guard sysctl(&mib, 6, buf, &len, nil, 0) == 0 else { return nil }
+    guard sysctl(&mib, 6, buf, &len, nil, 0) == 0 else { return [] }
     var off = 0
+    var out: [RouteInfo] = []
+    var seen = Set<String>()
     while off < len {
         let hdr = UnsafeRawPointer(buf.advanced(by: off))
         let msgLen = Int(hdr.load(
@@ -222,16 +224,44 @@ nonisolated func discoverDefaultRoute() -> RouteInfo? {
                     fromByteOffset: RT.OFF_IDX, as: UInt16.self
                 )
                 let name = ifaceName(index: idx) ?? "en0"
-                let ia = ifaceAddrs(name: name)
-                return RouteInfo(
-                    interface: name,
-                    selfIP: ia?.ipv4 ?? IPv4(0),
-                    gateway: gw,
-                    mask: ia?.mask ?? IPv4(0x00FFFFFF)
-                )
+                let key = "\(name)|\(gw.raw)"
+                if !seen.contains(key) {
+                    seen.insert(key)
+                    let ia = ifaceAddrs(name: name)
+                    out.append(RouteInfo(
+                        interface: name,
+                        selfIP: ia?.ipv4 ?? IPv4(0),
+                        gateway: gw,
+                        mask: ia?.mask ?? IPv4(0x00FFFFFF)
+                    ))
+                }
             }
         }
         off += msgLen
+    }
+    return out
+}
+
+nonisolated func discoverDefaultRoute() -> RouteInfo? {
+    discoverDefaultRoutes().first
+}
+
+nonisolated func discoverPrimaryDNS() -> IPv4? {
+    guard let txt = try? String(
+        contentsOfFile: "/etc/resolv.conf", encoding: .utf8
+    ) else {
+        return nil
+    }
+    for line in txt.split(separator: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("nameserver") {
+            let parts = trimmed.split(
+                separator: " ", omittingEmptySubsequences: true
+            )
+            if parts.count >= 2, let ip = IPv4(String(parts[1])) {
+                return ip
+            }
+        }
     }
     return nil
 }
@@ -762,12 +792,15 @@ final class WiFiHealth: ObservableObject {
     @Published var peers: [PeerView] = []
     @Published var discoveredHosts: Int = 0
     @Published var score: Int = 0
+    @Published var localScore: Int = 0
+    @Published var upstreamScore: Int = 0
     @Published var floorMs: Double = 0
     @Published var rxKbps: Double = 0
     @Published var txKbps: Double = 0
     @Published var rssi: Int? = nil
     @Published var bssid: String? = nil
     @Published var ssid: String? = nil
+    @Published var diagnosis: String = "Initializing"
 
     private let store = ProbeStore()
     private let resolver = NameResolver()
@@ -776,26 +809,36 @@ final class WiFiHealth: ObservableObject {
     private var names: [UInt32: String] = [:]
     private var macs: [UInt32: String] = [:]
     private var gateway: IPv4?
+    private var wifiGateway: IPv4?
+    private var dnsProbe: IPv4?
+    private let internetProbe: IPv4 = IPv4("1.1.1.1")!
     private var ifName: String = ""
+    private var defaultIface: String = "—"
+    private var targetIps: Set<UInt32> = []
     private var lastIfStats: IfaceStats?
     private var refresh: Timer?
-    private var sweepT: Timer?
-    private let maxExtraPeers = 6
     #if os(macOS)
     private let wifi = CWWiFiClient.shared()
     #endif
 
     func start() {
         stop()
-        status = "Finding gateway…"
-        guard let info = discoverDefaultRoute() else {
+        status = "Discovering network path…"
+        let routes = discoverDefaultRoutes()
+        guard let info = routes.first else {
             status = "No default route"
             return
         }
+        let wifiIface = "en0"
+        let wifiRoute = routes.first { $0.interface == wifiIface }
+
         ifName = info.interface
         ifaceName = info.interface
+        defaultIface = info.interface
         selfIP = info.selfIP.description
         gateway = info.gateway
+        wifiGateway = wifiRoute?.gateway
+        dnsProbe = discoverPrimaryDNS()
         gatewayIP = info.gateway.description
         do {
             let p = try ICMPProber()
@@ -803,12 +846,17 @@ final class WiFiHealth: ObservableObject {
             p.onSample = { ip, sample in
                 s.ingest(ip, sample)
             }
-            p.addTarget(info.gateway, maxInflight: 6)
-            labels[info.gateway.raw] = "Gateway"
-            store.ensure(info.gateway)
+            addFixedTarget(info.gateway, label: "Gateway", maxInflight: 6, prober: p)
+            if let wgw = wifiRoute?.gateway, wgw.raw != info.gateway.raw {
+                addFixedTarget(wgw, label: "Wi-Fi GW", maxInflight: 6, prober: p)
+            }
+            if let dns = dnsProbe, dns.raw != info.gateway.raw {
+                addFixedTarget(dns, label: "DNS", maxInflight: 4, prober: p)
+            }
+            addFixedTarget(internetProbe, label: "Internet", maxInflight: 3, prober: p)
             p.start(hz: 30)
             prober = p
-            status = "Probing at 30 Hz"
+            status = "Segmented probing at 30 Hz"
         } catch {
             status = "ICMP socket failed"
             return
@@ -819,6 +867,11 @@ final class WiFiHealth: ObservableObject {
             }
         }
         resolver.resolve(info.gateway)
+        if let wgw = wifiRoute?.gateway, wgw.raw != info.gateway.raw {
+            resolver.resolve(wgw)
+        }
+        if let dns = dnsProbe { resolver.resolve(dns) }
+        resolver.resolve(internetProbe)
         refresh = Timer.scheduledTimer(
             withTimeInterval: 0.1, repeats: true
         ) { [weak self] _ in
@@ -826,24 +879,28 @@ final class WiFiHealth: ObservableObject {
                 self?.tickUI()
             }
         }
-        sweepT = Timer.scheduledTimer(
-            withTimeInterval: 60.0, repeats: true
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.lanSweep()
-            }
-        }
-        lanSweep()
     }
 
     func stop() {
         prober?.stop()
         prober = nil
         refresh?.invalidate()
-        sweepT?.invalidate()
         refresh = nil
-        sweepT = nil
         lastIfStats = nil
+        targetIps.removeAll()
+    }
+
+    private func addFixedTarget(
+        _ ip: IPv4,
+        label: String,
+        maxInflight: Int,
+        prober: ICMPProber
+    ) {
+        guard !targetIps.contains(ip.raw) else { return }
+        targetIps.insert(ip.raw)
+        labels[ip.raw] = label
+        store.ensure(ip)
+        prober.addTarget(ip, maxInflight: maxInflight)
     }
 
     private func tickUI() {
@@ -876,9 +933,14 @@ final class WiFiHealth: ObservableObject {
             return $0.id.raw < $1.id.raw
         }
         peers = views
+        discoveredHosts = peers.count
         updateThroughput()
         updateWiFiInfo()
-        score = computeScore(snaps10: snaps10)
+        let scores = computeScores(snaps10: snaps10)
+        localScore = scores.local
+        upstreamScore = scores.upstream
+        score = scores.overall
+        diagnosis = computeDiagnosis(snaps10: snaps10)
     }
 
     private func updateThroughput() {
@@ -913,68 +975,84 @@ final class WiFiHealth: ObservableObject {
         #endif
     }
 
-    private func computeScore(
+    private func computeScores(
         snaps10: [(IPv4, RollingStats.Snapshot)]
-    ) -> Int {
-        guard let gw = gateway,
-              let snap = snaps10.first(where: {
-                  $0.0.raw == gw.raw
-              })?.1,
-              snap.count > 5 else { return 0 }
-        let rtt = clamp(100 * (50.0 - snap.p50) / 48.0)
-        let loss = clamp(100 * (5.0 - snap.loss) / 5.0)
-        let jit = clamp(100 * (20.0 - snap.jitter) / 19.0)
+    ) -> (local: Int, upstream: Int, overall: Int) {
+        let map = Dictionary(uniqueKeysWithValues: snaps10.map { ($0.0.raw, $0.1) })
+        guard let gw = gateway, let gwSnap = map[gw.raw], gwSnap.count > 5 else {
+            return (0, 0, 0)
+        }
+
+        let localSnap: RollingStats.Snapshot = {
+            if let wgw = wifiGateway, let s = map[wgw.raw], s.count > 5 {
+                return s
+            }
+            return gwSnap
+        }()
+        let dnsSnap = dnsProbe.flatMap { map[$0.raw] }
+        let netSnap = map[internetProbe.raw]
+
+        let localQ = quality(localSnap, good: 8, bad: 120)
+        let gwQ = quality(gwSnap, good: 5, bad: 90)
+        let dnsQ = dnsSnap.map { quality($0, good: 20, bad: 1600) } ?? gwQ
+        let netQ = netSnap.map { quality($0, good: 30, bad: 1500) } ?? dnsQ
+        let upstreamQ = 0.35 * gwQ + 0.35 * dnsQ + 0.30 * netQ
+
+        var pathScore = 0.35 * localQ + 0.20 * gwQ + 0.20 * dnsQ + 0.25 * netQ
+        if localQ > 80 && netQ < 45 {
+            // Penalize "false good link" cases: local gateway good, upstream poor.
+            pathScore -= 20
+        }
+
         var rssiS = 70.0
         #if os(macOS)
         if let r = rssi {
             rssiS = clamp(100 * (Double(r) + 90.0) / 40.0)
         }
         #endif
-        let s = 0.4 * loss + 0.3 * rtt
-            + 0.2 * jit + 0.1 * rssiS
-        return Int(s.rounded())
+        let s = 0.9 * pathScore + 0.1 * rssiS
+        return (
+            Int(clamp(localQ).rounded()),
+            Int(clamp(upstreamQ).rounded()),
+            Int(clamp(s).rounded())
+        )
+    }
+
+    private func quality(
+        _ s: RollingStats.Snapshot, good: Double, bad: Double
+    ) -> Double {
+        let rtt = clamp(100 * (bad - s.p50) / max(1, bad - good))
+        let loss = clamp(100 * (5.0 - s.loss) / 5.0)
+        let jit = clamp(100 * (40.0 - s.jitter) / 40.0)
+        return 0.60 * rtt + 0.25 * loss + 0.15 * jit
+    }
+
+    private func computeDiagnosis(
+        snaps10: [(IPv4, RollingStats.Snapshot)]
+    ) -> String {
+        let map = Dictionary(uniqueKeysWithValues: snaps10.map { ($0.0.raw, $0.1) })
+        guard let gw = gateway, let gwSnap = map[gw.raw], gwSnap.count > 5 else {
+            return "Insufficient samples"
+        }
+        let localSnap = wifiGateway.flatMap { map[$0.raw] } ?? gwSnap
+        let netSnap = map[internetProbe.raw]
+        guard let iSnap = netSnap, iSnap.count > 5 else {
+            return "Collecting upstream samples…"
+        }
+        if localSnap.p50 < 25 && iSnap.p50 > 150 {
+            if defaultIface.hasPrefix("utun") {
+                return "Local link good; upstream VPN/tunnel path degraded"
+            }
+            return "Local link good; upstream/WAN path degraded"
+        }
+        if localSnap.p50 > 40 || localSnap.loss > 2 {
+            return "Local Wi-Fi/LAN path degraded"
+        }
+        return "Path looks stable"
     }
 
     private func clamp(_ v: Double) -> Double {
         min(100, max(0, v))
-    }
-
-    private func lanSweep() {
-        guard let info = discoverDefaultRoute(),
-              let prober = prober else { return }
-        let exclude: Set<UInt32> = [
-            info.selfIP.raw, info.gateway.raw,
-        ]
-        let peers = subnet24(from: info.selfIP, exclude: exclude)
-        for ip in peers { prober.pingOnce(ip) }
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + 1.2
-        ) { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.adoptArpPeers()
-            }
-        }
-    }
-
-    private func adoptArpPeers() {
-        let entries = dumpArpTable()
-        discoveredHosts = entries.count
-        guard let p = prober else { return }
-        let current = Set(
-            store.snapshots(window: 1).map { $0.0.raw }
-        )
-        var added = 0
-        for e in entries {
-            if e.ip.raw == gateway?.raw { continue }
-            macs[e.ip.raw] = displayMac(e.mac)
-            resolver.resolve(e.ip)
-            if current.contains(e.ip.raw) { continue }
-            if added >= maxExtraPeers { break }
-            store.ensure(e.ip)
-            p.addTarget(e.ip, maxInflight: 3)
-            labels[e.ip.raw] = "Host"
-            added += 1
-        }
     }
 
     private func applyName(_ ip: IPv4, _ name: String) {
@@ -1021,17 +1099,38 @@ struct ContentView: View {
     }
 
     private var scoreCard: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text("\(health.score)")
-                .font(.system(
-                    size: 56, weight: .bold, design: .rounded
-                ))
-                .foregroundStyle(scoreColor)
-                .monospacedDigit()
-            Text("/100")
-                .foregroundStyle(.secondary)
+        HStack(alignment: .top, spacing: 14) {
+            scoreBlock(
+                title: "Local",
+                value: health.localScore,
+                color: scoreColor(health.localScore)
+            )
+            scoreBlock(
+                title: "Upstream",
+                value: health.upstreamScore,
+                color: scoreColor(health.upstreamScore)
+            )
             Spacer()
             rssiView
+        }
+    }
+
+    private func scoreBlock(
+        title: String, value: Int, color: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("\(value)")
+                    .font(.system(size: 40, weight: .bold, design: .rounded))
+                    .foregroundStyle(color)
+                    .monospacedDigit()
+                Text("/100")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -1057,12 +1156,23 @@ struct ContentView: View {
         #endif
     }
 
-    private var scoreColor: Color {
-        switch health.score {
+    private func scoreColor(_ score: Int) -> Color {
+        switch score {
         case 80...: return .green
         case 50...: return .yellow
         default:    return .red
         }
+    }
+
+    private var diagnosisColor: Color {
+        let gap = health.localScore - health.upstreamScore
+        if health.upstreamScore < 40 || gap > 35 {
+            return .red
+        }
+        if health.upstreamScore < 65 || gap > 15 || health.localScore < 65 {
+            return .orange
+        }
+        return .green
     }
 
     private var infoCard: some View {
@@ -1074,7 +1184,7 @@ struct ContentView: View {
             }
             HStack(spacing: 12) {
                 Text("gw \(health.gatewayIP)")
-                Text("\(health.discoveredHosts) hosts")
+                Text("\(health.discoveredHosts) probes")
                 Spacer(minLength: 0)
             }
             HStack(spacing: 12) {
@@ -1087,6 +1197,12 @@ struct ContentView: View {
                 ))
                 Spacer(minLength: 0)
             }
+            Text("path \(health.diagnosis)")
+                .foregroundStyle(diagnosisColor)
+                .lineLimit(1)
+            Text("overall \(health.score)/100")
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
         .font(.caption.monospacedDigit())
         .foregroundStyle(.secondary)
