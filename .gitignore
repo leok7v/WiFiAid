@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Xcode build products / derived data
+Build/
+DerivedData/
+build/
+*.xcarchive
+
+# Per-user Xcode state (UI layout, breakpoints, recent files, etc.)
+# We intentionally keep xcshareddata/ tracked (shared schemes live
+# there and belong in the repo).
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods / Carthage (not currently used, but safe)
+Pods/
+Carthage/Build/
+
+# Personal signing config: contains DEVELOPMENT_TEAM, kept out of git.
+# A committed template lives at Developer.xcconfig.template — copy
+# it to Developer.xcconfig and fill in your team identifier.
+Developer.xcconfig
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# Misc
+*.log
+*.pyc
+__pycache__/
