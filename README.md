@@ -6,6 +6,10 @@ A real-time Wi-Fi health monitor for macOS (with stub support for iOS) built wit
 
 WiFiAid continuously probes your local network using ICMP echo requests and surfaces latency, packet loss, jitter, and throughput metrics for your gateway and nearby LAN hosts. It presents everything in a compact, auto-refreshing dashboard alongside a 0–100 health score so you can tell at a glance how your Wi-Fi connection is behaving.
 
+<img width="480" height="482" alt="macos" src="https://github.com/user-attachments/assets/91d978da-b005-4b33-a7aa-7516d98bb7d5" />
+
+<img width="375" height="640" alt="ios" src="https://github.com/user-attachments/assets/35e74c53-29ba-4a81-9c00-27b019d7d274" />
+
 ## Features
 
 | Feature | Detail |
