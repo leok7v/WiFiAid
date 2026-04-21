@@ -105,3 +105,46 @@ jitterScore = clamp(100 × (20 − jitter)  / 19)
 rssiScore   = clamp(100 × (RSSI + 90)    / 40)   [dBm; −90 → 0, −50 → 100]
 ```
 
+## AI experiments (to suggest what to do)
+
+Free AI: "LLM from URL" — https://818233.xyz/ used
+
+https://www.reddit.com/r/LLMDevs/comments/1mm0j73/i_built_a_free_ai_service_to_get_chat_completions/
+https://www.scamadviser.com/check-website/818233.xyz
+https://www.reddit.com/user/yvonuk/
+
+https://github.com/ruanyf/weekly/issues/7738
+https://github.com/ruanyf/weekly/issues/7517
+
+also works as Web Proxy e.g. https://web.818233.xyz/wikipedia.org
+https://x.com/mcwangcn/status/1954984384907579886
+
+Other Free AI services from: https://free.waxianzhi.com/
+
+Completely free / No login required:
+
+LM Arena — https://lmarena.ai/
+Free AI Image Generator — https://freeaiimage.net/zh/
+Free AI for Everyone — https://free.stockai.trade/
+LLM from URL — https://818233.xyz/
+Face Swap Video — https://faceswapvideo.io/
+Dreamify AI Painting Charity Station — https://dreamify.slmnb.cn/zh
+Stable Diffusion Online — https://stablediffusionweb.com/
+Scribble Diffusion — https://scribblediffusion.com/
+TinyWow — https://tinywow.com/
+Tldraw — https://www.tldraw.com/
+
+Completely free / Registration or login required (for reference):
+
+Nano Banana / Gemini 2.5 Flash Image — https://gemini.google.com/
+Google AI Studio — https://aistudio.google.com/
+AnyRouter Charity Website — https://anyrouter.top/
+Codeium — https://codeium.com/
+Hugging Face — https://huggingface.co/
+CapCut — https://www.capcut.com/
+Civitai — https://civitai.com/
+
+
+curl -N -X POST https://free.stockai.trade/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openrouter/free","webSearch":false,"targetLanguage":"en","id":"test1","messages":[{"id":"u1","role":"user","parts":[{"type":"text","text":"Say hello in 3 words"}]}]}'

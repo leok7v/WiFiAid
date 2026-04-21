@@ -7,13 +7,14 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		B3F2E40A2F9601A6007C168C /* TheApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3F2E4092F9601A6007C168C /* TheApp.swift */; };
+		B3F2E40A2F9601A6007C168C /* WiFiAid.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3F2E4092F9601A6007C168C /* WiFiAid.swift */; };
 		B3F2E40E2F9601A6007C168C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B3F2E40D2F9601A6007C168C /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		B3DEBA482F96E844006F0764 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		B3F2E4062F9601A6007C168C /* WiFiAid.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WiFiAid.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		B3F2E4092F9601A6007C168C /* TheApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TheApp.swift; sourceTree = "<group>"; };
+		B3F2E4092F9601A6007C168C /* WiFiAid.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WiFiAid.swift; sourceTree = "<group>"; };
 		B3F2E40D2F9601A6007C168C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B3F2E4302F9601A6007C168C /* Developer.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Developer.xcconfig; sourceTree = "<group>"; };
 		B3F6DCA22F9606120093C3B6 /* WiFiAid.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WiFiAid.entitlements; sourceTree = "<group>"; };
@@ -36,7 +37,8 @@
 				B3F2E4302F9601A6007C168C /* Developer.xcconfig */,
 				B3F6DCA22F9606120093C3B6 /* WiFiAid.entitlements */,
 				B3F2E40D2F9601A6007C168C /* Assets.xcassets */,
-				B3F2E4092F9601A6007C168C /* TheApp.swift */,
+				B3F2E4092F9601A6007C168C /* WiFiAid.swift */,
+				B3DEBA482F96E844006F0764 /* README.md */,
 				B3F2E4072F9601A6007C168C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -121,7 +123,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				B3F2E40A2F9601A6007C168C /* TheApp.swift in Sources */,
+				B3F2E40A2F9601A6007C168C /* WiFiAid.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

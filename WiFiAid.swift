@@ -13,11 +13,10 @@ nonisolated func nowNs() -> UInt64 {
     return UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
 }
 
-nonisolated func msFromNs(_ ns: UInt64) -> Double {
-    Double(ns) / 1_000_000
-}
+nonisolated func msFromNs(_ ns: UInt64) -> Double { Double(ns) / 1_000_000 }
 
 nonisolated struct IPv4: Hashable, Sendable, CustomStringConvertible {
+
     let raw: UInt32
 
     init(_ n: UInt32) { self.raw = n }
@@ -602,6 +601,19 @@ nonisolated func lookupHostname(_ ip: IPv4) -> String? {
     return n == ip.description ? nil : n
 }
 
+nonisolated func measureDnsMs(_ hostname: String = "apple.com") -> Double? {
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_STREAM
+    var res: UnsafeMutablePointer<addrinfo>?
+    let t0 = nowNs()
+    let rc = getaddrinfo(hostname, nil, &hints, &res)
+    let dt = nowNs() - t0
+    if let r = res { freeaddrinfo(r) }
+    if rc != 0 { return nil }
+    return msFromNs(dt)
+}
+
 nonisolated final class NameResolver: @unchecked Sendable {
     private let queue = DispatchQueue(
         label: "wifi.names", qos: .utility,
@@ -798,11 +810,19 @@ final class WiFiHealth: ObservableObject {
     @Published var rxKbps: Double = 0
     @Published var txKbps: Double = 0
     @Published var rssi: Int? = nil
+    @Published var noise: Int? = nil
+    @Published var channel: String? = nil
+    @Published var txRate: Double? = nil
     @Published var bssid: String? = nil
     @Published var ssid: String? = nil
+    @Published var dnsMs: Double? = nil
     @Published var diagnosis: String = "Initializing"
+    @Published var explanationLog: [(id: Date, text: String)] = []
+    @Published var aiResponse: String = ""
+    @Published var aiLoading: Bool = false
 
     private let store = ProbeStore()
+    private var lastExplanation: String = ""
     private let resolver = NameResolver()
     private var prober: ICMPProber?
     private var labels: [UInt32: String] = [:]
@@ -816,6 +836,7 @@ final class WiFiHealth: ObservableObject {
     private var defaultIface: String = "—"
     private var targetIps: Set<UInt32> = []
     private var lastIfStats: IfaceStats?
+    private var dnsTick: Int = 0
     private var refresh: Timer?
     #if os(macOS)
     private let wifi = CWWiFiClient.shared()
@@ -846,14 +867,23 @@ final class WiFiHealth: ObservableObject {
             p.onSample = { ip, sample in
                 s.ingest(ip, sample)
             }
-            addFixedTarget(info.gateway, label: "Gateway", maxInflight: 6, prober: p)
+            addFixedTarget(
+                info.gateway, label: "Gateway",
+                maxInflight: 6, prober: p
+            )
             if let wgw = wifiRoute?.gateway, wgw.raw != info.gateway.raw {
-                addFixedTarget(wgw, label: "Wi-Fi GW", maxInflight: 6, prober: p)
+                addFixedTarget(
+                    wgw, label: "Wi-Fi GW",
+                    maxInflight: 6, prober: p
+                )
             }
             if let dns = dnsProbe, dns.raw != info.gateway.raw {
                 addFixedTarget(dns, label: "DNS", maxInflight: 4, prober: p)
             }
-            addFixedTarget(internetProbe, label: "Internet", maxInflight: 3, prober: p)
+            addFixedTarget(
+                internetProbe, label: "Internet",
+                maxInflight: 3, prober: p
+            )
             p.start(hz: 30)
             prober = p
             status = "Segmented probing at 30 Hz"
@@ -941,6 +971,30 @@ final class WiFiHealth: ObservableObject {
         upstreamScore = scores.upstream
         score = scores.overall
         diagnosis = computeDiagnosis(snaps10: snaps10)
+        let expl = computeExplanation(snaps10: snaps10)
+        let skeleton = expl.replacingOccurrences(
+            of: "[0-9]+\\.?[0-9]*", with: "#",
+            options: .regularExpression
+        )
+        if skeleton != lastExplanation {
+            lastExplanation = skeleton
+            explanationLog.insert((id: Date(), text: expl), at: 0)
+            if explanationLog.count > 10 {
+                explanationLog.removeLast(explanationLog.count - 10)
+            }
+        } else if let first = explanationLog.first {
+            // Same shape, just update numbers in-place
+            explanationLog[0] = (id: first.id, text: expl)
+        }
+        dnsTick += 1
+        if dnsTick % 20 == 1 { // every ~2s (tick is 0.1s)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let ms = measureDnsMs()
+                Task { @MainActor [weak self] in
+                    self?.dnsMs = ms
+                }
+            }
+        }
     }
 
     private func updateThroughput() {
@@ -951,8 +1005,9 @@ final class WiFiHealth: ObservableObject {
         let dt = Double(curr.ts - prev.ts) / 1e9
         let rx = delta32(curr.ibytes, prev.ibytes)
         let tx = delta32(curr.obytes, prev.obytes)
-        rxKbps = Double(rx) * 8.0 / dt / 1000.0
-        txKbps = Double(tx) * 8.0 / dt / 1000.0
+        let a = 0.3 // EMA smoothing factor
+        rxKbps = a * (Double(rx) * 8.0 / dt / 1000.0) + (1 - a) * rxKbps
+        txKbps = a * (Double(tx) * 8.0 / dt / 1000.0) + (1 - a) * txKbps
     }
 
     private func delta32(_ c: UInt64, _ p: UInt64) -> UInt64 {
@@ -965,10 +1020,37 @@ final class WiFiHealth: ObservableObject {
         if let iface = wifi.interface() {
             let r = iface.rssiValue()
             rssi = r == 0 ? nil : Int(r)
+            let n = iface.noiseMeasurement()
+            noise = n == 0 ? nil : Int(n)
+            if let ch = iface.wlanChannel() {
+                let band: String
+                switch ch.channelBand {
+                case .band2GHz: band = "2.4G"
+                case .band5GHz: band = "5G"
+                case .band6GHz: band = "6G"
+                default:        band = ""
+                }
+                let width: String
+                switch ch.channelWidth {
+                case .width20MHz:  width = "/20"
+                case .width40MHz:  width = "/40"
+                case .width80MHz:  width = "/80"
+                case .width160MHz: width = "/160"
+                default:           width = ""
+                }
+                channel = "ch\(ch.channelNumber) \(band)\(width)"
+            } else {
+                channel = nil
+            }
+            let tr = iface.transmitRate()
+            txRate = tr > 0 ? tr : nil
             bssid = iface.bssid()
             ssid = iface.ssid()
         } else {
             rssi = nil
+            noise = nil
+            channel = nil
+            txRate = nil
             bssid = nil
             ssid = nil
         }
@@ -978,8 +1060,13 @@ final class WiFiHealth: ObservableObject {
     private func computeScores(
         snaps10: [(IPv4, RollingStats.Snapshot)]
     ) -> (local: Int, upstream: Int, overall: Int) {
-        let map = Dictionary(uniqueKeysWithValues: snaps10.map { ($0.0.raw, $0.1) })
-        guard let gw = gateway, let gwSnap = map[gw.raw], gwSnap.count > 5 else {
+        let map = Dictionary(
+            uniqueKeysWithValues:
+                snaps10.map { ($0.0.raw, $0.1) }
+        )
+        guard let gw = gateway,
+              let gwSnap = map[gw.raw],
+              gwSnap.count > 5 else {
             return (0, 0, 0)
         }
 
@@ -1000,7 +1087,8 @@ final class WiFiHealth: ObservableObject {
 
         var pathScore = 0.35 * localQ + 0.20 * gwQ + 0.20 * dnsQ + 0.25 * netQ
         if localQ > 80 && netQ < 45 {
-            // Penalize "false good link" cases: local gateway good, upstream poor.
+            // Penalize "false good link" cases:
+            // local gateway good, upstream poor.
             pathScore -= 20
         }
 
@@ -1030,8 +1118,13 @@ final class WiFiHealth: ObservableObject {
     private func computeDiagnosis(
         snaps10: [(IPv4, RollingStats.Snapshot)]
     ) -> String {
-        let map = Dictionary(uniqueKeysWithValues: snaps10.map { ($0.0.raw, $0.1) })
-        guard let gw = gateway, let gwSnap = map[gw.raw], gwSnap.count > 5 else {
+        let map = Dictionary(
+            uniqueKeysWithValues:
+                snaps10.map { ($0.0.raw, $0.1) }
+        )
+        guard let gw = gateway,
+              let gwSnap = map[gw.raw],
+              gwSnap.count > 5 else {
             return "Insufficient samples"
         }
         let localSnap = wifiGateway.flatMap { map[$0.raw] } ?? gwSnap
@@ -1051,6 +1144,261 @@ final class WiFiHealth: ObservableObject {
         return "Path looks stable"
     }
 
+    private func computeExplanation(
+        snaps10: [(IPv4, RollingStats.Snapshot)]
+    ) -> String {
+        let map = Dictionary(
+            uniqueKeysWithValues:
+                snaps10.map { ($0.0.raw, $0.1) }
+        )
+        guard let gw = gateway,
+              let gwSnap = map[gw.raw],
+              gwSnap.count > 5 else {
+            return "Waiting for enough probe data"
+                + " to analyze your connection."
+        }
+        let localSnap = wifiGateway.flatMap { map[$0.raw] } ?? gwSnap
+        let netSnap = map[internetProbe.raw]
+
+        var lines: [String] = []
+
+        // Wi-Fi radio assessment
+        #if os(macOS)
+        if let r = rssi, let n = noise {
+            let snr = r - n
+            if snr < 15 {
+                lines.append(
+                    "SNR \(snr) dB is poor"
+                    + " — high noise or weak signal;"
+                    + " try moving closer to the AP"
+                    + " or switching channels."
+                )
+            } else if r < -75 {
+                lines.append(
+                    "Signal is weak (\(r) dBm)"
+                    + " despite OK noise — move"
+                    + " closer to the access point."
+                )
+            }
+        }
+        if let tr = txRate, tr < 100 {
+            lines.append(
+                "PHY Tx rate \(Int(tr)) Mbps is low"
+                + " — possible interference"
+                + " or distance issue."
+            )
+        }
+        #endif
+
+        // VPN awareness
+        if defaultIface.hasPrefix("utun") {
+            lines.append(
+                "Traffic routes through VPN"
+                + " (\(defaultIface)); upstream"
+                + " latency includes tunnel"
+                + " overhead."
+            )
+        }
+
+        // Local link
+        if localSnap.p50 > 40 {
+            let p50s = String(
+                format: "%.0f", localSnap.p50
+            )
+            lines.append(
+                "Local gateway latency is high"
+                + " (\(p50s) ms) — possible"
+                + " Wi-Fi congestion or AP"
+                + " overload."
+            )
+        } else if localSnap.loss > 2 {
+            let losss = String(
+                format: "%.1f", localSnap.loss
+            )
+            lines.append(
+                "Packet loss to local gateway"
+                + " (\(losss)%) — check for"
+                + " interference or AP issues."
+            )
+        }
+        if localSnap.jitter > 15 {
+            let jits = String(
+                format: "%.1f", localSnap.jitter
+            )
+            lines.append(
+                "High local jitter"
+                + " (\(jits) ms) — bursty traffic"
+                + " or channel contention."
+            )
+        }
+
+        // Upstream
+        if let iSnap = netSnap, iSnap.count > 5 {
+            if iSnap.p50 > 150 && localSnap.p50 < 25 {
+                let ip50 = String(
+                    format: "%.0f", iSnap.p50
+                )
+                lines.append(
+                    "Internet latency"
+                    + " (\(ip50) ms) is far above"
+                    + " local — bottleneck is"
+                    + " upstream, not your Wi-Fi."
+                )
+            }
+            if iSnap.loss > 3 {
+                let iLoss = String(
+                    format: "%.1f", iSnap.loss
+                )
+                lines.append(
+                    "Internet packet loss is"
+                    + " \(iLoss)% — upstream path"
+                    + " is dropping packets."
+                )
+            }
+        }
+
+        // DNS
+        if let d = dnsMs {
+            if d > 200 {
+                lines.append(
+                    "DNS resolution took"
+                    + " \(Int(d)) ms — slow DNS"
+                    + " can make browsing feel"
+                    + " sluggish."
+                )
+            }
+        }
+
+        if lines.isEmpty {
+            return "Connection looks healthy."
+                + " Local link and upstream path"
+                + " are within normal range."
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    func safeDiagnosticText() -> String {
+        // SAFETY: This method must NEVER include IP addresses, SSIDs,
+        // BSSIDs, MAC addresses, hostnames, or interface names.
+        // Only anonymous numeric stats and generic labels.
+        let snaps10 = store.snapshots(window: 10)
+        let map = Dictionary(
+            uniqueKeysWithValues:
+                snaps10.map { ($0.0.raw, $0.1) }
+        )
+        let gwSnap = gateway.flatMap { map[$0.raw] }
+        let localSnap = wifiGateway.flatMap { map[$0.raw] } ?? gwSnap
+        let netSnap = map[internetProbe.raw]
+        var s = ""
+        s += "Local \(localScore)/100,"
+            + " Upstream \(upstreamScore)/100,"
+            + " Overall \(score)/100\n"
+        s += String(format: "Floor %.2f ms", floorMs)
+        if let ls = localSnap {
+            s += String(
+                format: ", Local p50 %.1f ms,"
+                    + " loss %.1f%%, jitter %.1f ms",
+                ls.p50, ls.loss, ls.jitter
+            )
+        }
+        s += "\n"
+        if let ns = netSnap {
+            s += String(
+                format: "Internet p50 %.1f ms,"
+                    + " loss %.1f%%\n",
+                ns.p50, ns.loss
+            )
+        }
+        if let d = dnsMs {
+            s += String(format: "DNS resolution %.0f ms\n", d)
+        }
+        #if os(macOS)
+        if let r = rssi {
+            s += "RSSI \(r) dBm"
+            if let n = noise { s += ", Noise \(n) dBm, SNR \(r - n) dB" }
+            s += "\n"
+        }
+        if let ch = channel { s += "Channel \(ch)" }
+        if let tr = txRate { s += String(format: ", PHY Tx %.0f Mbps", tr) }
+        if channel != nil || txRate != nil { s += "\n" }
+        #endif
+        s += String(
+            format: "Throughput rx %.0f"
+                + " / tx %.0f kbps\n",
+            rxKbps, txKbps
+        )
+        let via = defaultIface.hasPrefix("utun")
+            ? "VPN tunnel" : "direct"
+        s += "Route via \(via)\n"
+        s += "Diagnosis: \(diagnosis)"
+        return s
+    }
+
+    func askAI() {
+        guard !aiLoading else { return }
+        let stats = safeDiagnosticText()
+        let latest = explanationLog.first?.text ?? diagnosis
+        let query = "Stats: \(stats) | \(latest)"
+            + " —- reply plain text two sentences"
+            + " max, no markdown,"
+            + " single fix or suggestion"
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        guard let encoded = query.addingPercentEncoding(
+            withAllowedCharacters: allowed
+        ), let url = URL(string: "https://818233.xyz/\(encoded)") else {
+            return
+        }
+        aiLoading = true
+        aiResponse = ""
+        let req = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 30
+        )
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            let text: String
+            if let err = err {
+                text = "Error: \(err.localizedDescription)"
+            } else if let data = data,
+                      let body = String(
+                        data: data, encoding: .utf8
+                      ) {
+                // Strip HTML tags, ad banners, and dashed separator lines
+                let stripped = body
+                    .replacingOccurrences(
+                        of: "<[^>]+>", with: "",
+                        options: .regularExpression
+                    )
+                    .components(separatedBy: "\n")
+                    .filter { line in
+                        let t = line.trimmingCharacters(in: .whitespaces)
+                        if t.allSatisfy({ $0 == "-" }),
+                           t.count > 3 {
+                            return false
+                        }
+                        if t.lowercased().contains("chatbyok") { return false }
+                        let lo = t.lowercased()
+                        if lo.contains("best native"),
+                           lo.contains("experience") {
+                            return false
+                        }
+                        return true
+                    }
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                text = stripped
+                print("[WiFiAid AI] \(stripped)")
+            } else {
+                text = "No response"
+            }
+            Task { @MainActor [weak self] in
+                self?.aiResponse = text
+                self?.aiLoading = false
+            }
+        }.resume()
+    }
+
     private func clamp(_ v: Double) -> Double {
         min(100, max(0, v))
     }
@@ -1061,12 +1409,12 @@ final class WiFiHealth: ObservableObject {
 }
 
 @main
-struct WiFiAidApp: App {
+struct WiFiAid: App {
     var body: some Scene {
         WindowGroup("WiFiAid") {
             ContentView()
             #if os(macOS)
-                .frame(minWidth: 480, minHeight: 580)
+                .frame(minWidth: 480, minHeight: 700)
             #endif
         }
     }
@@ -1075,17 +1423,29 @@ struct WiFiAidApp: App {
 struct ContentView: View {
 
     @StateObject private var health = WiFiHealth()
+    @State private var showAIConfirm = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            header
-            scoreCard
-            infoCard
-            peerList
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                header
+                scoreCard
+                infoCard
+                peerList
+                explanationPanel
+            }
+            .padding(16)
         }
-        .padding(16)
         .onAppear { health.start() }
         .onDisappear { health.stop() }
+        .alert("Ask AI", isPresented: $showAIConfirm) {
+            Button("Send") { health.askAI() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This will send anonymous network stats (scores, latency, "
+               + "throughput) to an external AI service. No IP addresses, "
+               + "SSIDs, or other identifying information is included.")
+        }
     }
 
     private var header: some View {
@@ -1139,15 +1499,23 @@ struct ContentView: View {
         #if os(macOS)
         if let r = health.rssi {
             VStack(alignment: .trailing, spacing: 1) {
-                Text("\(r) dBm")
-                    .font(.headline.monospacedDigit())
+                HStack(spacing: 6) {
+                    Text("\(r) dBm")
+                        .font(.headline.monospacedDigit())
+                        .foregroundStyle(rssiColor(r))
+                    if let n = health.noise {
+                        Text("SNR \(r - n)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if let ch = health.channel {
+                    Text(ch).font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
                 if let s = health.ssid {
                     Text(s).font(.caption)
                         .foregroundStyle(.secondary)
-                }
-                if let b = health.bssid {
-                    Text(b).font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
                 }
             }
         }
@@ -1162,6 +1530,12 @@ struct ContentView: View {
         case 50...: return .yellow
         default:    return .red
         }
+    }
+
+    private func rssiColor(_ rssi: Int) -> Color {
+        if rssi >= -50 { return .green }
+        if rssi >= -67 { return .yellow }
+        return .red
     }
 
     private var diagnosisColor: Color {
@@ -1191,20 +1565,30 @@ struct ContentView: View {
                 Text(String(
                     format: "floor %.2f ms", health.floorMs
                 ))
-                Text(String(
-                    format: "rx %.0f / tx %.0f kbps",
-                    health.rxKbps, health.txKbps
-                ))
+                let rx = fmtKbps(health.rxKbps)
+                let tx = fmtKbps(health.txKbps)
+                Text("rx \(rx) / tx \(tx)")
                 Spacer(minLength: 0)
             }
-            Text("path \(health.diagnosis)")
+            HStack(spacing: 12) {
+                if let d = health.dnsMs {
+                    Text(String(format: "dns %.0f ms", d))
+                }
+                #if os(macOS)
+                if let tr = health.txRate {
+                    Text(String(format: "phy %g Mbps", tr))
+                }
+                #endif
+                Spacer(minLength: 0)
+            }
+            Text(health.diagnosis)
                 .foregroundStyle(diagnosisColor)
                 .lineLimit(1)
             Text("overall \(health.score)/100")
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .font(.caption.monospacedDigit())
+        .font(.caption.monospaced())
         .foregroundStyle(.secondary)
         .lineLimit(1)
         .minimumScaleFactor(0.8)
@@ -1214,13 +1598,9 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             peerHeader
             Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(health.peers) { p in
-                        peerRow(p)
-                        Divider()
-                    }
-                }
+            ForEach(health.peers) { p in
+                peerRow(p)
+                Divider()
             }
         }
     }
@@ -1288,6 +1668,161 @@ struct ContentView: View {
         default:   return .red
         }
     }
+
+    private static let timeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    private var explanationPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Log").font(.caption.bold())
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(health.explanationLog, id: \.id) { entry in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(Self.timeFmt.string(from: entry.id))
+                            .foregroundStyle(.tertiary)
+                        Text(entry.text)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+#if         ASK_AI // just for fun
+            askAIButton
+            if !health.aiResponse.isEmpty {
+                Text(health.aiResponse)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+#endif
+        }
+    }
+
+    private var askAIButton: some View {
+        AskAIGlowButton(loading: health.aiLoading) {
+            showAIConfirm = true
+        }
+    }
+}
+
+private struct AskAIGlowButton: View {
+    let loading: Bool
+    let action: () -> Void
+    @State private var stops: [Gradient.Stop] = Self.randomStops()
+
+    private static let colors: [Color] = [
+        Color(red: 0.74, green: 0.51, blue: 0.95), // #BC82F3
+        Color(red: 0.96, green: 0.73, blue: 0.92), // #F5B9EA
+        Color(red: 0.55, green: 0.62, blue: 1.00), // #8D9FFF
+        Color(red: 1.00, green: 0.40, blue: 0.47), // #FF6778
+        Color(red: 1.00, green: 0.73, blue: 0.44), // #FFBA71
+        Color(red: 0.78, green: 0.53, blue: 1.00), // #C686FF
+    ]
+
+    private static func randomStops() -> [Gradient.Stop] {
+        colors.map {
+            Gradient.Stop(color: $0, location: Double.random(in: 0...1))
+        }.sorted { $0.location < $1.location }
+    }
+
+    private let timer = Timer.publish(
+        every: 0.5, on: .main, in: .common
+    ).autoconnect()
+
+    @State private var sweep: CGFloat = 0
+
+    var body: some View {
+        ZStack {
+            // Outer glow layers
+            glowLayer(width: 2, blur: 0)
+            glowLayer(width: 4, blur: 3)
+            glowLayer(width: 6, blur: 8)
+            // Translucent glass interior
+            Capsule()
+                .fill(.ultraThinMaterial)
+                .padding(1.5)
+            // Aurora color wash over the glass
+            Capsule()
+                .fill(
+                    LinearGradient(
+                        stops: stops.map {
+                            Gradient.Stop(
+                                color: $0.color.opacity(0.15),
+                                location: $0.location
+                            )
+                        },
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .padding(1.5)
+            // Sweep highlight while loading
+            if loading {
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                .clear,
+                                .white.opacity(0.12),
+                                .clear,
+                            ],
+                            startPoint: UnitPoint(x: sweep - 0.3, y: 0.5),
+                            endPoint: UnitPoint(x: sweep + 0.3, y: 0.5)
+                        )
+                    )
+                    .padding(1.5)
+            }
+            // Label
+            Text(loading ? "Asking…" : "Ask AI")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.white.opacity(0.6))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .frame(height: 52)
+        .contentShape(Capsule())
+        .onTapGesture { if !loading { action() } }
+        .onReceive(timer) { _ in
+            withAnimation(.easeInOut(duration: 0.8)) {
+                stops = Self.randomStops()
+            }
+        }
+        .onChange(of: loading) { _, isLoading in
+            if isLoading {
+                sweep = -0.3
+                withAnimation(
+                    .linear(duration: 1.2)
+                    .repeatForever(autoreverses: false)
+                ) {
+                    sweep = 1.3
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.3)) {
+                    sweep = 0
+                }
+            }
+        }
+    }
+
+    private func glowLayer(width: CGFloat, blur: CGFloat) -> some View {
+        Capsule()
+            .strokeBorder(
+                AngularGradient(
+                    gradient: Gradient(stops: stops),
+                    center: .center
+                ),
+                lineWidth: width
+            )
+            .blur(radius: blur)
+            .opacity(0.9)
+    }
 }
 
 private func fmtMs(_ v: Double) -> String {
@@ -1297,3 +1832,8 @@ private func fmtMs(_ v: Double) -> String {
 private func fmtPct(_ v: Double) -> String {
     String(format: "%.1f%%", v)
 }
+
+private func fmtKbps(_ v: Double) -> String {
+    v < 1 ? "  —  " : String(format: "%5.0f kbps", v)
+}
+
