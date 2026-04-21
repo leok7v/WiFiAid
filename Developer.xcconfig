@@ -1,7 +1,23 @@
-CODE_SIGN_STYLE = Manual
-CODE_SIGN_IDENTITY = -
-DEVELOPMENT_TEAM =
-PROVISIONING_PROFILE_SPECIFIER =
+// macOS: Sign to Run Locally
+CODE_SIGN_STYLE[sdk=macosx*] = Manual
+CODE_SIGN_IDENTITY[sdk=macosx*] = -
+DEVELOPMENT_TEAM[sdk=macosx*] =
+PROVISIONING_PROFILE_SPECIFIER[sdk=macosx*] =
+
+// iOS/visionOS: Automatic signing
+CODE_SIGN_STYLE[sdk=iphoneos*] = Automatic
+CODE_SIGN_STYLE[sdk=iphonesimulator*] = Automatic
+CODE_SIGN_STYLE[sdk=xros*] = Automatic
+CODE_SIGN_STYLE[sdk=xrsimulator*] = Automatic
+CODE_SIGN_IDENTITY[sdk=iphoneos*] = Apple Development
+CODE_SIGN_IDENTITY[sdk=iphonesimulator*] = Apple Development
+CODE_SIGN_IDENTITY[sdk=xros*] = Apple Development
+CODE_SIGN_IDENTITY[sdk=xrsimulator*] = Apple Development
+DEVELOPMENT_TEAM[sdk=iphoneos*] = 692R843P25
+DEVELOPMENT_TEAM[sdk=iphonesimulator*] = 692R843P25
+DEVELOPMENT_TEAM[sdk=xros*] = 692R843P25
+DEVELOPMENT_TEAM[sdk=xrsimulator*] = 692R843P25
+
 ENABLE_HARDENED_RUNTIME = NO
 CODE_SIGN_ENTITLEMENTS =
 REGISTER_APP_GROUPS = NO
